@@ -14,12 +14,13 @@ st.caption("Stratégie de trading par croisement de moyennes mobiles simples (go
 with st.sidebar:
     st.header("Paramètres")
 
-    ticker = st.text_input("Ticker (ex: SPY, AAPL, MSFT)", value="SPY").upper()
+    ticker = st.text_input("Ticker (ex: SPY, AAPL, MSFT)").upper().strip()
 
     col1, col2 = st.columns(2)
     with col1:
         start_date = st.date_input("Début", value=date(2018, 1, 1))
     with col2:
+        # Évite de demander une date de fin égale au jour courant si le marché n'a pas encore fermé
         end_date = st.date_input("Fin", value=date.today())
 
     sma_short = st.slider("SMA rapide (jours)", min_value=5, max_value=100, value=20, step=1)
@@ -29,72 +30,134 @@ with st.sidebar:
         st.warning("La SMA rapide doit être plus courte que la SMA lente.")
         st.stop()
 
-    capital = st.number_input("Capital initial ($)", min_value=1000, max_value=1_000_000, value=10_000, step=1000)
+    capital = st.number_input(
+        "Capital initial ($)",
+        min_value=1000,
+        max_value=1_000_000,
+        value=10_000,
+        step=1000
+    )
 
     run = st.button("Lancer le backtest", type="primary", use_container_width=True)
 
-@st.cache_data(ttl=3600)
-def load_data(ticker, start, end):
-    df = yf.download(ticker, start=start, end=end, progress=False, auto_adjust=True)
-    if df.empty:
-        return None
-    df = df[["Close"]].copy()
-    df.columns = ["Close"]
-    df.dropna(inplace=True)
-    return df
 
-def run_backtest(df, short_w, long_w, capital):
+@st.cache_data(ttl=3600)
+def load_data(ticker: str, start, end):
+    """
+    Charge les données avec yfinance et retourne:
+    - df: DataFrame avec colonne Close
+    - error_message: None si OK, sinon message d'erreur
+    """
+    try:
+        if not ticker:
+            return None, "Le ticker est vide."
+
+        start_ts = pd.to_datetime(start)
+        end_ts = pd.to_datetime(end)
+
+        if start_ts >= end_ts:
+            return None, "La date de début doit être antérieure à la date de fin."
+
+        # Yahoo Finance traite souvent end comme exclusif
+        end_ts = end_ts + pd.Timedelta(days=1)
+
+        df = yf.download(
+            ticker,
+            start=start_ts,
+            end=end_ts,
+            progress=False,
+            auto_adjust=True,
+            threads=False
+        )
+
+        if df is None or df.empty:
+            return None, f"Aucune donnée retournée pour {ticker}. Vérifie le ticker, la période, ou réessaie plus tard."
+
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+
+        if "Close" not in df.columns:
+            return None, f"La colonne 'Close' est absente pour {ticker}. Colonnes reçues: {list(df.columns)}"
+
+        df = df[["Close"]].copy()
+        df.columns = ["Close"]
+        df.dropna(inplace=True)
+
+        if df.empty:
+            return None, f"Les données de clôture de {ticker} sont vides après nettoyage."
+
+        return df, None
+
+    except Exception as e:
+        return None, f"Erreur lors du chargement des données pour {ticker}: {e}"
+
+
+def run_backtest(df: pd.DataFrame, short_w: int, long_w: int, capital: float):
     df = df.copy()
+
     df["SMA_fast"] = df["Close"].rolling(short_w).mean()
     df["SMA_slow"] = df["Close"].rolling(long_w).mean()
     df.dropna(inplace=True)
 
-    df["signal"] = np.where(df["SMA_fast"] > df["SMA_slow"], 1, 0)
-    df["position"] = df["signal"].diff()
+    if df.empty:
+        return None, [], [], capital
 
-    cash = capital
+    df["signal"] = np.where(df["SMA_fast"] > df["SMA_slow"], 1, 0)
+    df["position"] = df["signal"].diff().fillna(0)
+
+    cash = float(capital)
     shares = 0.0
     portfolio_values = []
     buy_signals = []
     sell_signals = []
 
-    for i, (idx, row) in enumerate(df.iterrows()):
-        if row["position"] == 1 and cash > 0:
-            shares = cash / row["Close"]
-            cash = 0
-            buy_signals.append((idx, row["Close"]))
-        elif row["position"] == -1 and shares > 0:
-            cash = shares * row["Close"]
-            shares = 0
-            sell_signals.append((idx, row["Close"]))
-        portfolio_values.append(cash + shares * row["Close"])
+    for idx, row in df.iterrows():
+        price = float(row["Close"])
 
-    if shares > 0:
-        cash = shares * df["Close"].iloc[-1]
-        shares = 0
+        if row["position"] == 1 and cash > 0:
+            shares = cash / price
+            cash = 0.0
+            buy_signals.append((idx, price))
+
+        elif row["position"] == -1 and shares > 0:
+            cash = shares * price
+            shares = 0.0
+            sell_signals.append((idx, price))
+
+        portfolio_values.append(cash + shares * price)
+
+    final_value = cash + shares * float(df["Close"].iloc[-1])
 
     df["portfolio"] = portfolio_values
-    df["bh"] = capital * df["Close"] / df["Close"].iloc[0]
+    df["bh"] = capital * df["Close"] / float(df["Close"].iloc[0])
 
-    return df, buy_signals, sell_signals, cash
+    df.attrs["short_w"] = short_w
+    df.attrs["long_w"] = long_w
 
-def compute_metrics(df, capital):
-    final_val = df["portfolio"].iloc[-1]
+    return df, buy_signals, sell_signals, final_value
+
+
+def compute_metrics(df: pd.DataFrame, capital: float):
+    final_val = float(df["portfolio"].iloc[-1])
     total_return = (final_val - capital) / capital * 100
-    bh_return = (df["bh"].iloc[-1] - capital) / capital * 100
+    bh_return = (float(df["bh"].iloc[-1]) - capital) / capital * 100
 
     daily_returns = df["portfolio"].pct_change().dropna()
-    sharpe = (daily_returns.mean() * 252) / (daily_returns.std() * np.sqrt(252)) if daily_returns.std() > 0 else 0
+
+    if len(daily_returns) > 1 and daily_returns.std() > 0:
+        sharpe = (daily_returns.mean() / daily_returns.std()) * np.sqrt(252)
+    else:
+        sharpe = 0.0
 
     rolling_max = df["portfolio"].cummax()
     drawdown = (df["portfolio"] - rolling_max) / rolling_max
-    max_dd = drawdown.min() * 100
+    max_dd = float(drawdown.min()) * 100 if not drawdown.empty else 0.0
 
-    n_trades = len(df[df["position"] != 0])
+    n_trades = int((df["position"] != 0).sum())
 
-    win_days = (daily_returns > 0).sum()
-    total_days = len(daily_returns)
-    win_rate = win_days / total_days * 100 if total_days > 0 else 0
+    win_days = int((daily_returns > 0).sum())
+    total_days = int(len(daily_returns))
+    win_rate = (win_days / total_days * 100) if total_days > 0 else 0.0
 
     return {
         "final_val": final_val,
@@ -107,9 +170,11 @@ def compute_metrics(df, capital):
         "drawdown": drawdown
     }
 
-def plot_results(df, buy_signals, sell_signals, ticker, metrics):
+
+def plot_results(df: pd.DataFrame, buy_signals, sell_signals, ticker: str, metrics: dict):
     fig = make_subplots(
-        rows=3, cols=1,
+        rows=3,
+        cols=1,
         shared_xaxes=True,
         row_heights=[0.5, 0.3, 0.2],
         vertical_spacing=0.04,
@@ -120,63 +185,109 @@ def plot_results(df, buy_signals, sell_signals, ticker, metrics):
         )
     )
 
-    fig.add_trace(go.Scatter(
-        x=df.index, y=df["Close"],
-        name="Prix", line=dict(color="#378ADD", width=1.5),
-        hovertemplate="%{x|%d %b %Y}<br>Prix: $%{y:.2f}<extra></extra>"
-    ), row=1, col=1)
+    fig.add_trace(
+        go.Scatter(
+            x=df.index,
+            y=df["Close"],
+            name="Prix",
+            line=dict(color="#378ADD", width=1.5),
+            hovertemplate="%{x|%d %b %Y}<br>Prix: $%{y:.2f}<extra></extra>"
+        ),
+        row=1,
+        col=1
+    )
 
-    fig.add_trace(go.Scatter(
-        x=df.index, y=df["SMA_fast"],
-        name=f"SMA {df.attrs.get('short_w', 'rapide')}",
-        line=dict(color="#EF9F27", width=1.5, dash="dot"),
-        hovertemplate="SMA rapide: $%{y:.2f}<extra></extra>"
-    ), row=1, col=1)
+    fig.add_trace(
+        go.Scatter(
+            x=df.index,
+            y=df["SMA_fast"],
+            name=f"SMA {df.attrs.get('short_w', 'rapide')}",
+            line=dict(color="#EF9F27", width=1.5, dash="dot"),
+            hovertemplate="SMA rapide: $%{y:.2f}<extra></extra>"
+        ),
+        row=1,
+        col=1
+    )
 
-    fig.add_trace(go.Scatter(
-        x=df.index, y=df["SMA_slow"],
-        name=f"SMA {df.attrs.get('long_w', 'lente')}",
-        line=dict(color="#7F77DD", width=1.5),
-        hovertemplate="SMA lente: $%{y:.2f}<extra></extra>"
-    ), row=1, col=1)
+    fig.add_trace(
+        go.Scatter(
+            x=df.index,
+            y=df["SMA_slow"],
+            name=f"SMA {df.attrs.get('long_w', 'lente')}",
+            line=dict(color="#7F77DD", width=1.5),
+            hovertemplate="SMA lente: $%{y:.2f}<extra></extra>"
+        ),
+        row=1,
+        col=1
+    )
 
     if buy_signals:
         bx, by = zip(*buy_signals)
-        fig.add_trace(go.Scatter(
-            x=list(bx), y=list(by),
-            mode="markers", name="Achat",
-            marker=dict(color="#1D9E75", size=9, symbol="triangle-up"),
-            hovertemplate="%{x|%d %b %Y}<br>Achat: $%{y:.2f}<extra></extra>"
-        ), row=1, col=1)
+        fig.add_trace(
+            go.Scatter(
+                x=list(bx),
+                y=list(by),
+                mode="markers",
+                name="Achat",
+                marker=dict(color="#1D9E75", size=9, symbol="triangle-up"),
+                hovertemplate="%{x|%d %b %Y}<br>Achat: $%{y:.2f}<extra></extra>"
+            ),
+            row=1,
+            col=1
+        )
 
     if sell_signals:
         sx, sy = zip(*sell_signals)
-        fig.add_trace(go.Scatter(
-            x=list(sx), y=list(sy),
-            mode="markers", name="Vente",
-            marker=dict(color="#E24B4A", size=9, symbol="triangle-down"),
-            hovertemplate="%{x|%d %b %Y}<br>Vente: $%{y:.2f}<extra></extra>"
-        ), row=1, col=1)
+        fig.add_trace(
+            go.Scatter(
+                x=list(sx),
+                y=list(sy),
+                mode="markers",
+                name="Vente",
+                marker=dict(color="#E24B4A", size=9, symbol="triangle-down"),
+                hovertemplate="%{x|%d %b %Y}<br>Vente: $%{y:.2f}<extra></extra>"
+            ),
+            row=1,
+            col=1
+        )
 
-    fig.add_trace(go.Scatter(
-        x=df.index, y=df["portfolio"],
-        name="Stratégie", line=dict(color="#1D9E75", width=2),
-        hovertemplate="%{x|%d %b %Y}<br>Portefeuille: $%{y:,.0f}<extra></extra>"
-    ), row=2, col=1)
+    fig.add_trace(
+        go.Scatter(
+            x=df.index,
+            y=df["portfolio"],
+            name="Stratégie",
+            line=dict(color="#1D9E75", width=2),
+            hovertemplate="%{x|%d %b %Y}<br>Portefeuille: $%{y:,.0f}<extra></extra>"
+        ),
+        row=2,
+        col=1
+    )
 
-    fig.add_trace(go.Scatter(
-        x=df.index, y=df["bh"],
-        name="Buy & Hold", line=dict(color="#B4B2A9", width=1.5, dash="dash"),
-        hovertemplate="%{x|%d %b %Y}<br>Buy & Hold: $%{y:,.0f}<extra></extra>"
-    ), row=2, col=1)
+    fig.add_trace(
+        go.Scatter(
+            x=df.index,
+            y=df["bh"],
+            name="Buy & Hold",
+            line=dict(color="#B4B2A9", width=1.5, dash="dash"),
+            hovertemplate="%{x|%d %b %Y}<br>Buy & Hold: $%{y:,.0f}<extra></extra>"
+        ),
+        row=2,
+        col=1
+    )
 
-    fig.add_trace(go.Scatter(
-        x=df.index, y=metrics["drawdown"] * 100,
-        name="Drawdown", fill="tozeroy",
-        line=dict(color="#E24B4A", width=1),
-        fillcolor="rgba(226,75,74,0.15)",
-        hovertemplate="%{x|%d %b %Y}<br>Drawdown: %{y:.1f}%<extra></extra>"
-    ), row=3, col=1)
+    fig.add_trace(
+        go.Scatter(
+            x=df.index,
+            y=metrics["drawdown"] * 100,
+            name="Drawdown",
+            fill="tozeroy",
+            line=dict(color="#E24B4A", width=1),
+            fillcolor="rgba(226,75,74,0.15)",
+            hovertemplate="%{x|%d %b %Y}<br>Drawdown: %{y:.1f}%<extra></extra>"
+        ),
+        row=3,
+        col=1
+    )
 
     fig.update_layout(
         height=680,
@@ -197,18 +308,38 @@ def plot_results(df, buy_signals, sell_signals, ticker, metrics):
 
 if run:
     with st.spinner(f"Chargement des données pour {ticker}..."):
-        df = load_data(ticker, start_date, end_date)
+        df, load_error = load_data(ticker, start_date, end_date)
 
-    if df is None or len(df) < sma_long + 10:
-        st.error(f"Impossible de charger les données pour **{ticker}**. Vérifie le ticker et la période.")
+    if load_error:
+        st.error(load_error)
         st.stop()
 
-    df, buy_signals, sell_signals, final_cash = run_backtest(df, sma_short, sma_long, capital)
+    st.success(f"{len(df)} lignes chargées pour {ticker}.")
+    st.caption(f"Période couverte : du {df.index.min().date()} au {df.index.max().date()}")
+
+    min_required = sma_long + 10
+    if len(df) < min_required:
+        st.error(
+            f"Pas assez de données pour calculer correctement la stratégie sur **{ticker}**. "
+            f"{len(df)} lignes chargées, mais il en faut au moins **{min_required}**. "
+            f"Choisis une période plus longue ou réduis la SMA lente."
+        )
+        st.stop()
+
+    df, buy_signals, sell_signals, final_value = run_backtest(df, sma_short, sma_long, capital)
+
+    if df is None or df.empty:
+        st.error("Le backtest n’a pas pu être exécuté, car les données après calcul des moyennes mobiles sont insuffisantes.")
+        st.stop()
+
     metrics = compute_metrics(df, capital)
 
     col1, col2, col3, col4, col5 = st.columns(5)
-    col1.metric("Rendement stratégie", f"{metrics['total_return']:+.1f}%",
-                delta=f"{metrics['total_return'] - metrics['bh_return']:+.1f}% vs B&H")
+    col1.metric(
+        "Rendement stratégie",
+        f"{metrics['total_return']:+.1f}%",
+        delta=f"{metrics['total_return'] - metrics['bh_return']:+.1f}% vs B&H"
+    )
     col2.metric("Buy & Hold", f"{metrics['bh_return']:+.1f}%")
     col3.metric("Ratio de Sharpe", f"{metrics['sharpe']:.2f}")
     col4.metric("Max drawdown", f"{metrics['max_dd']:.1f}%")
@@ -223,9 +354,14 @@ if run:
 
     with st.expander("Voir les données brutes"):
         st.dataframe(
-            df[["Close", "SMA_fast", "SMA_slow", "portfolio", "bh"]].tail(100).style.format({
-                "Close": "${:.2f}", "SMA_fast": "${:.2f}", "SMA_slow": "${:.2f}",
-                "portfolio": "${:,.0f}", "bh": "${:,.0f}"
+            df[["Close", "SMA_fast", "SMA_slow", "portfolio", "bh"]]
+            .tail(100)
+            .style.format({
+                "Close": "${:.2f}",
+                "SMA_fast": "${:.2f}",
+                "SMA_slow": "${:.2f}",
+                "portfolio": "${:,.0f}",
+                "bh": "${:,.0f}"
             }),
             use_container_width=True
         )
