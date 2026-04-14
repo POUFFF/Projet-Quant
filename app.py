@@ -4,9 +4,25 @@ import numpy as np
 import yfinance as yf
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
-from datetime import date, timedelta
+from datetime import date
+from scipy import stats
 
 st.set_page_config(page_title="SMA Momentum Backtester", layout="wide")
+
+# Style global pour ajouter plus d'espace
+st.markdown("""
+<style>
+div[data-testid="metric-container"] {
+    padding: 18px 20px;
+    margin-bottom: 8px;
+}
+
+.block-container {
+    padding-top: 2rem;
+    padding-bottom: 2rem;
+}
+</style>
+""", unsafe_allow_html=True)
 
 st.title("SMA Momentum Backtester")
 st.caption("Stratégie de trading par croisement de moyennes mobiles simples (golden cross / death cross)")
@@ -20,7 +36,6 @@ with st.sidebar:
     with col1:
         start_date = st.date_input("Début", value=date(2018, 1, 1))
     with col2:
-        # Évite de demander une date de fin égale au jour courant si le marché n'a pas encore fermé
         end_date = st.date_input("Fin", value=date.today())
 
     sma_short = st.slider("SMA rapide (jours)", min_value=5, max_value=100, value=20, step=1)
@@ -51,11 +66,6 @@ with st.sidebar:
 
 @st.cache_data(ttl=3600)
 def load_data(ticker: str, start, end):
-    """
-    Charge les données avec yfinance et retourne:
-    - df: DataFrame avec colonne Close
-    - error_message: None si OK, sinon message d'erreur
-    """
     try:
         if not ticker:
             return None, "Le ticker est vide."
@@ -66,7 +76,6 @@ def load_data(ticker: str, start, end):
         if start_ts >= end_ts:
             return None, "La date de début doit être antérieure à la date de fin."
 
-        # Yahoo Finance traite souvent end comme exclusif
         end_ts = end_ts + pd.Timedelta(days=1)
 
         df = yf.download(
@@ -114,14 +123,14 @@ def run_backtest(df, short_w, long_w, capital, fees=0.0):
     portfolio_values = []
     buy_signals = []
     sell_signals = []
-    total_fees_paid = 0.0  # nouveau
+    total_fees_paid = 0.0
 
     for idx, row in df.iterrows():
         price = float(row["Close"])
 
         if row["position"] == 1 and cash > 0:
-            fee = cash * fees          # frais sur l'achat
-            cash -= fee                # on déduit les frais du cash
+            fee = cash * fees
+            cash -= fee
             total_fees_paid += fee
             shares = cash / price
             cash = 0.0
@@ -129,8 +138,8 @@ def run_backtest(df, short_w, long_w, capital, fees=0.0):
 
         elif row["position"] == -1 and shares > 0:
             cash = shares * price
-            fee = cash * fees          # frais sur la vente
-            cash -= fee                # on déduit les frais du cash reçu
+            fee = cash * fees
+            cash -= fee
             total_fees_paid += fee
             shares = 0.0
             sell_signals.append((idx, price))
@@ -142,11 +151,12 @@ def run_backtest(df, short_w, long_w, capital, fees=0.0):
     df["bh"] = capital * df["Close"] / float(df["Close"].iloc[0])
     df.attrs["short_w"] = short_w
     df.attrs["long_w"] = long_w
-    df.attrs["total_fees"] = total_fees_paid  # nouveau
+    df.attrs["total_fees"] = total_fees_paid
 
     return df, buy_signals, sell_signals, final_value
 
-def compute_metrics(df: pd.DataFrame, capital: float):
+
+def compute_metrics(df, capital):
     final_val = float(df["portfolio"].iloc[-1])
     total_return = (final_val - capital) / capital * 100
     bh_return = (float(df["bh"].iloc[-1]) - capital) / capital * 100
@@ -163,10 +173,18 @@ def compute_metrics(df: pd.DataFrame, capital: float):
     max_dd = float(drawdown.min()) * 100 if not drawdown.empty else 0.0
 
     n_trades = int((df["position"] != 0).sum())
-
     win_days = int((daily_returns > 0).sum())
     total_days = int(len(daily_returns))
     win_rate = (win_days / total_days * 100) if total_days > 0 else 0.0
+
+    confidence = 0.95
+    var_historical = float(np.percentile(daily_returns, (1 - confidence) * 100))
+
+    mu = daily_returns.mean()
+    sigma = daily_returns.std()
+    var_parametric = float(stats.norm.ppf(1 - confidence, mu, sigma))
+
+    var_dollar = var_historical * final_val
 
     return {
         "final_val": final_val,
@@ -176,7 +194,11 @@ def compute_metrics(df: pd.DataFrame, capital: float):
         "max_dd": max_dd,
         "n_trades": n_trades,
         "win_rate": win_rate,
-        "drawdown": drawdown
+        "drawdown": drawdown,
+        "var_historical": var_historical * 100,
+        "var_parametric": var_parametric * 100,
+        "var_dollar": var_dollar,
+        "daily_returns": daily_returns,
     }
 
 
@@ -186,7 +208,7 @@ def plot_results(df: pd.DataFrame, buy_signals, sell_signals, ticker: str, metri
         cols=1,
         shared_xaxes=True,
         row_heights=[0.5, 0.3, 0.2],
-        vertical_spacing=0.04,
+        vertical_spacing=0.06,
         subplot_titles=(
             f"{ticker} — Prix et moyennes mobiles",
             "Valeur du portefeuille vs Buy & Hold",
@@ -299,10 +321,10 @@ def plot_results(df: pd.DataFrame, buy_signals, sell_signals, ticker: str, metri
     )
 
     fig.update_layout(
-        height=680,
+        height=760,
         hovermode="x unified",
         legend=dict(orientation="h", yanchor="bottom", y=1.01, xanchor="left", x=0),
-        margin=dict(t=60, b=20, l=0, r=0),
+        margin=dict(t=70, b=30, l=0, r=0),
         plot_bgcolor="white",
         paper_bgcolor="white"
     )
@@ -343,24 +365,88 @@ if run:
 
     metrics = compute_metrics(df, capital)
 
-    col1, col2, col3, col4, col5, col6 = st.columns(6)
+    # Ligne 1
+    col1, col2, col3, col4 = st.columns(4, gap="large")
+
     col1.metric(
         "Rendement stratégie",
         f"{metrics['total_return']:+.1f}%",
         delta=f"{metrics['total_return'] - metrics['bh_return']:+.1f}% vs B&H"
     )
+
     col2.metric("Buy & Hold", f"{metrics['bh_return']:+.1f}%")
     col3.metric("Ratio de Sharpe", f"{metrics['sharpe']:.2f}")
     col4.metric("Max drawdown", f"{metrics['max_dd']:.1f}%")
-    col5.metric("Nb. de trades", metrics["n_trades"])
-    col6.metric("Frais payés", f"${df.attrs.get('total_fees', 0):,.0f}")
 
+    # Espace
+    st.markdown("<br>", unsafe_allow_html=True)
+
+    # Ligne 2
+    col5, col6, col7 = st.columns(3, gap="large")
+
+    col5.metric("VaR 95% (1j)", f"{metrics['var_historical']:.2f}%")
+    col6.metric("VaR en $", f"${abs(metrics['var_dollar']):,.0f}")
+    col7.metric("Frais payés", f"${df.attrs.get('total_fees', 0):,.0f}")
+
+    st.markdown("<br>", unsafe_allow_html=True)
     st.divider()
+    st.markdown("<br>", unsafe_allow_html=True)
 
     fig = plot_results(df, buy_signals, sell_signals, ticker, metrics)
     st.plotly_chart(fig, use_container_width=True)
 
+    st.markdown("<br><br>", unsafe_allow_html=True)
     st.divider()
+    st.markdown("<br>", unsafe_allow_html=True)
+
+    st.subheader("Distribution des rendements journaliers")
+
+    fig_var = go.Figure()
+
+    fig_var.add_trace(go.Histogram(
+        x=metrics["daily_returns"] * 100,
+        nbinsx=60,
+        name="Rendements",
+        marker=dict(color="#378ADD"),
+        opacity=0.7
+    ))
+
+    var_line = metrics["var_historical"]
+    fig_var.add_vline(
+        x=var_line,
+        line_dash="dash",
+        line_color="#E24B4A",
+        line_width=2,
+        annotation_text=f"VaR 95% = {var_line:.2f}%",
+        annotation_position="top right"
+    )
+
+    fig_var.add_vline(
+        x=metrics["var_parametric"],
+        line_dash="dot",
+        line_color="#7F77DD",
+        line_width=2,
+        annotation_text=f"VaR paramétrique = {metrics['var_parametric']:.2f}%",
+        annotation_position="top left"
+    )
+
+    fig_var.update_layout(
+        height=360,
+        margin=dict(t=50, b=30, l=0, r=0),
+        plot_bgcolor="white",
+        paper_bgcolor="white",
+        xaxis_title="Rendement journalier (%)",
+        yaxis_title="Fréquence",
+        showlegend=False
+    )
+    fig_var.update_xaxes(gridcolor="#f0f0f0")
+    fig_var.update_yaxes(gridcolor="#f0f0f0")
+
+    st.plotly_chart(fig_var, use_container_width=True)
+
+    st.markdown("<br>", unsafe_allow_html=True)
+    st.divider()
+    st.markdown("<br>", unsafe_allow_html=True)
 
     with st.expander("Voir les données brutes"):
         st.dataframe(
