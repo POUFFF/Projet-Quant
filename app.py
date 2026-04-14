@@ -336,6 +336,32 @@ def plot_results(df: pd.DataFrame, buy_signals, sell_signals, ticker: str, metri
 
     return fig
 
+def monte_carlo(df, n_simulations=500, n_days=252):
+    close = df["Close"]
+    daily_returns = close.pct_change().dropna()
+
+    mu = daily_returns.mean()
+    sigma = daily_returns.std()
+    last_price = float(close.iloc[-1])
+
+    dt = 1
+    simulations = np.zeros((n_days, n_simulations))
+
+    for i in range(n_simulations):
+        prices = [last_price]
+        for _ in range(n_days - 1):
+            z = np.random.standard_normal()
+            price = prices[-1] * np.exp((mu - 0.5 * sigma**2) * dt + sigma * np.sqrt(dt) * z)
+            prices.append(price)
+        simulations[:, i] = prices
+
+    percentile_5  = np.percentile(simulations, 5,  axis=1)
+    percentile_25 = np.percentile(simulations, 25, axis=1)
+    percentile_50 = np.percentile(simulations, 50, axis=1)
+    percentile_75 = np.percentile(simulations, 75, axis=1)
+    percentile_95 = np.percentile(simulations, 95, axis=1)
+
+    return simulations, percentile_5, percentile_25, percentile_50, percentile_75, percentile_95, mu, sigma
 
 if run:
     with st.spinner(f"Chargement des données pour {ticker}..."):
@@ -461,6 +487,109 @@ if run:
             }),
             use_container_width=True
         )
+
+    st.subheader("Simulation Monte Carlo — projections sur 1 an")
+
+    n_sims = st.slider("Nombre de simulations", min_value=100, max_value=1000, value=500, step=100)
+
+    with st.spinner("Calcul des simulations..."):
+        sims, p5, p25, p50, p75, p95, mu_mc, sigma_mc = monte_carlo(
+            load_data(ticker, start_date, end_date)[0],
+            n_simulations=n_sims,
+            n_days=252
+        )
+
+    future_days = list(range(252))
+    last_price = float(df["Close"].iloc[-1])
+
+    fig_mc = go.Figure()
+
+    # Bande 5%-95% (zone grise large)
+    fig_mc.add_trace(go.Scatter(
+        x=future_days + future_days[::-1],
+        y=list(p95) + list(p5[::-1]),
+        fill="toself",
+        fillcolor="rgba(55, 138, 221, 0.08)",
+        line=dict(color="rgba(0,0,0,0)"),
+        name="Intervalle 90%",
+        hoverinfo="skip"
+    ))
+
+    # Bande 25%-75% (zone bleue plus foncée)
+    fig_mc.add_trace(go.Scatter(
+        x=future_days + future_days[::-1],
+        y=list(p75) + list(p25[::-1]),
+        fill="toself",
+        fillcolor="rgba(55, 138, 221, 0.18)",
+        line=dict(color="rgba(0,0,0,0)"),
+        name="Intervalle 50%",
+        hoverinfo="skip"
+    ))
+
+    # Quelques trajectoires individuelles
+    for i in range(min(50, n_sims)):
+        fig_mc.add_trace(go.Scatter(
+            x=future_days,
+            y=sims[:, i],
+            line=dict(color="rgba(55, 138, 221, 0.08)", width=1),
+            showlegend=False,
+            hoverinfo="skip"
+        ))
+
+    # Médiane
+    fig_mc.add_trace(go.Scatter(
+        x=future_days,
+        y=p50,
+        line=dict(color="#378ADD", width=2),
+        name="Médiane",
+        hovertemplate="Jour %{x}<br>Prix médian: $%{y:.2f}<extra></extra>"
+    ))
+
+    # P5 et P95
+    fig_mc.add_trace(go.Scatter(
+        x=future_days, y=p95,
+        line=dict(color="#1D9E75", width=1.5, dash="dash"),
+        name="95e percentile",
+        hovertemplate="Jour %{x}<br>P95: $%{y:.2f}<extra></extra>"
+    ))
+    fig_mc.add_trace(go.Scatter(
+        x=future_days, y=p5,
+        line=dict(color="#E24B4A", width=1.5, dash="dash"),
+        name="5e percentile",
+        hovertemplate="Jour %{x}<br>P5: $%{y:.2f}<extra></extra>"
+    ))
+
+    fig_mc.update_layout(
+        height=400,
+        hovermode="x unified",
+        margin=dict(t=20, b=20, l=0, r=0),
+        plot_bgcolor="white",
+        paper_bgcolor="white",
+        yaxis_title="Prix ($)",
+        xaxis_title="Jours dans le futur",
+        legend=dict(orientation="h", yanchor="bottom", y=1.01, xanchor="left", x=0)
+    )
+    fig_mc.update_xaxes(gridcolor="#f0f0f0")
+    fig_mc.update_yaxes(tickprefix="$", gridcolor="#f0f0f0")
+
+    st.plotly_chart(fig_mc, use_container_width=True)
+
+    # Métriques Monte Carlo
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("Prix actuel", f"${last_price:.2f}")
+    col2.metric("Prix médian dans 1 an", f"${p50[-1]:.2f}",
+                delta=f"{(p50[-1] / last_price - 1) * 100:+.1f}%")
+    col3.metric("Scénario pessimiste (P5)", f"${p5[-1]:.2f}",
+                delta=f"{(p5[-1] / last_price - 1) * 100:+.1f}%")
+    col4.metric("Scénario optimiste (P95)", f"${p95[-1]:.2f}",
+                delta=f"{(p95[-1] / last_price - 1) * 100:+.1f}%")
+
+    st.caption(
+        f"Paramètres estimés sur données historiques — "
+        f"rendement journalier moyen : {mu_mc * 100:.3f}%, "
+        f"volatilité journalière : {sigma_mc * 100:.3f}% "
+        f"({sigma_mc * np.sqrt(252) * 100:.1f}% annualisée)"
+    )
 
 else:
     st.info("Configure les paramètres dans la barre latérale et clique sur **Lancer le backtest**.")
