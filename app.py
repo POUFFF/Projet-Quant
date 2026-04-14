@@ -38,6 +38,14 @@ with st.sidebar:
         step=1000
     )
 
+    fees = st.slider(
+        "Frais de transaction (%)",
+        min_value=0.0,
+        max_value=1.0,
+        value=0.1,
+        step=0.05
+    ) / 100
+
     run = st.button("Lancer le backtest", type="primary", use_container_width=True)
 
 
@@ -92,15 +100,11 @@ def load_data(ticker: str, start, end):
         return None, f"Erreur lors du chargement des données pour {ticker}: {e}"
 
 
-def run_backtest(df: pd.DataFrame, short_w: int, long_w: int, capital: float):
+def run_backtest(df, short_w, long_w, capital, fees=0.0):
     df = df.copy()
-
     df["SMA_fast"] = df["Close"].rolling(short_w).mean()
     df["SMA_slow"] = df["Close"].rolling(long_w).mean()
     df.dropna(inplace=True)
-
-    if df.empty:
-        return None, [], [], capital
 
     df["signal"] = np.where(df["SMA_fast"] > df["SMA_slow"], 1, 0)
     df["position"] = df["signal"].diff().fillna(0)
@@ -110,32 +114,37 @@ def run_backtest(df: pd.DataFrame, short_w: int, long_w: int, capital: float):
     portfolio_values = []
     buy_signals = []
     sell_signals = []
+    total_fees_paid = 0.0  # nouveau
 
     for idx, row in df.iterrows():
         price = float(row["Close"])
 
         if row["position"] == 1 and cash > 0:
+            fee = cash * fees          # frais sur l'achat
+            cash -= fee                # on déduit les frais du cash
+            total_fees_paid += fee
             shares = cash / price
             cash = 0.0
             buy_signals.append((idx, price))
 
         elif row["position"] == -1 and shares > 0:
             cash = shares * price
+            fee = cash * fees          # frais sur la vente
+            cash -= fee                # on déduit les frais du cash reçu
+            total_fees_paid += fee
             shares = 0.0
             sell_signals.append((idx, price))
 
         portfolio_values.append(cash + shares * price)
 
     final_value = cash + shares * float(df["Close"].iloc[-1])
-
     df["portfolio"] = portfolio_values
     df["bh"] = capital * df["Close"] / float(df["Close"].iloc[0])
-
     df.attrs["short_w"] = short_w
     df.attrs["long_w"] = long_w
+    df.attrs["total_fees"] = total_fees_paid  # nouveau
 
     return df, buy_signals, sell_signals, final_value
-
 
 def compute_metrics(df: pd.DataFrame, capital: float):
     final_val = float(df["portfolio"].iloc[-1])
@@ -326,7 +335,7 @@ if run:
         )
         st.stop()
 
-    df, buy_signals, sell_signals, final_value = run_backtest(df, sma_short, sma_long, capital)
+    df, buy_signals, sell_signals, final_value = run_backtest(df, sma_short, sma_long, capital, fees)
 
     if df is None or df.empty:
         st.error("Le backtest n’a pas pu être exécuté, car les données après calcul des moyennes mobiles sont insuffisantes.")
@@ -334,7 +343,7 @@ if run:
 
     metrics = compute_metrics(df, capital)
 
-    col1, col2, col3, col4, col5 = st.columns(5)
+    col1, col2, col3, col4, col5, col6 = st.columns(6)
     col1.metric(
         "Rendement stratégie",
         f"{metrics['total_return']:+.1f}%",
@@ -344,6 +353,7 @@ if run:
     col3.metric("Ratio de Sharpe", f"{metrics['sharpe']:.2f}")
     col4.metric("Max drawdown", f"{metrics['max_dd']:.1f}%")
     col5.metric("Nb. de trades", metrics["n_trades"])
+    col6.metric("Frais payés", f"${df.attrs.get('total_fees', 0):,.0f}")
 
     st.divider()
 
