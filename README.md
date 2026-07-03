@@ -29,13 +29,13 @@ Teste des stratégies *momentum* et *mean-reversion* sur données de marché ré
 
 ---
 
-##Aperçu
+## Aperçu
 
 Ce projet simule l'application de règles de trading précises sur l'historique boursier, puis mesure **objectivement** leur performance et leur risque. Il illustre une démarche quantitative complète : de la génération de signaux jusqu'à la validation statistique d'une stratégie — en insistant sur les pièges qui rendent la plupart des backtests trompeurs (*look-ahead bias*, *overfitting*).
 
 ---
 
-##Fonctionnalités
+## Fonctionnalités
 
 ### Deux stratégies aux philosophies opposées
 - **Momentum — Croisement de moyennes mobiles (SMA)** : suit la tendance (golden cross / death cross)
@@ -106,7 +106,7 @@ print(compute_metrics(df, 10_000)["sharpe"])
 
 ```bash
 git clone https://github.com/AROY648/backtester-quantitatif
-cd Backtester
+cd backtester-quantitatif
 pip install -r requirements.txt
 streamlit run app.py
 ```
