@@ -8,15 +8,27 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
 
-def plot_results(df: pd.DataFrame, buy_signals, sell_signals, ticker: str, metrics: dict):
-    """Graphique principal : prix + SMA + signaux, portefeuille vs B&H, drawdown."""
+def plot_results(df: pd.DataFrame, buy_signals, sell_signals, ticker: str, metrics: dict,
+                 strategy: str = "sma", params: dict = None):
+    """Graphique principal : prix (+ indicateur), portefeuille vs B&H, drawdown.
+
+    Pour la SMA, les deux moyennes sont superposées au prix. Pour le RSI,
+    l'oscillateur est affiché séparément (plot_rsi) car il vit sur une échelle
+    de 0 à 100, pas en dollars.
+    """
+    params = params or {}
+    row1_title = (
+        f"{ticker} — Prix et moyennes mobiles" if strategy == "sma"
+        else f"{ticker} — Prix et signaux RSI"
+    )
+
     fig = make_subplots(
         rows=3, cols=1,
         shared_xaxes=True,
         row_heights=[0.5, 0.3, 0.2],
         vertical_spacing=0.06,
         subplot_titles=(
-            f"{ticker} — Prix et moyennes mobiles",
+            row1_title,
             "Valeur du portefeuille vs Buy & Hold",
             "Drawdown"
         )
@@ -28,19 +40,20 @@ def plot_results(df: pd.DataFrame, buy_signals, sell_signals, ticker: str, metri
         hovertemplate="%{x|%d %b %Y}<br>Prix: $%{y:.2f}<extra></extra>"
     ), row=1, col=1)
 
-    fig.add_trace(go.Scatter(
-        x=df.index, y=df["SMA_fast"],
-        name=f"SMA {df.attrs.get('short_w', 'rapide')}",
-        line=dict(color="#EF9F27", width=1.5, dash="dot"),
-        hovertemplate="SMA rapide: $%{y:.2f}<extra></extra>"
-    ), row=1, col=1)
+    if strategy == "sma":
+        fig.add_trace(go.Scatter(
+            x=df.index, y=df["SMA_fast"],
+            name=f"SMA {params.get('fast', 'rapide')}",
+            line=dict(color="#EF9F27", width=1.5, dash="dot"),
+            hovertemplate="SMA rapide: $%{y:.2f}<extra></extra>"
+        ), row=1, col=1)
 
-    fig.add_trace(go.Scatter(
-        x=df.index, y=df["SMA_slow"],
-        name=f"SMA {df.attrs.get('long_w', 'lente')}",
-        line=dict(color="#7F77DD", width=1.5),
-        hovertemplate="SMA lente: $%{y:.2f}<extra></extra>"
-    ), row=1, col=1)
+        fig.add_trace(go.Scatter(
+            x=df.index, y=df["SMA_slow"],
+            name=f"SMA {params.get('slow', 'lente')}",
+            line=dict(color="#7F77DD", width=1.5),
+            hovertemplate="SMA lente: $%{y:.2f}<extra></extra>"
+        ), row=1, col=1)
 
     if buy_signals:
         bx, by = zip(*buy_signals)
@@ -89,6 +102,36 @@ def plot_results(df: pd.DataFrame, buy_signals, sell_signals, ticker: str, metri
     fig.update_yaxes(ticksuffix="%", row=3, col=1, gridcolor="#f0f0f0")
     fig.update_xaxes(gridcolor="#f0f0f0")
 
+    return fig
+
+
+def plot_rsi(df: pd.DataFrame, oversold: int, overbought: int):
+    """Oscillateur RSI (0–100) avec les zones de survente et de surachat."""
+    fig = go.Figure()
+
+    # Zones colorées : sous `oversold` = survente (achat), au-dessus = surachat (vente)
+    fig.add_hrect(y0=0, y1=oversold, fillcolor="rgba(29,158,117,0.10)", line_width=0)
+    fig.add_hrect(y0=overbought, y1=100, fillcolor="rgba(226,75,74,0.10)", line_width=0)
+
+    fig.add_trace(go.Scatter(
+        x=df.index, y=df["RSI"], name="RSI",
+        line=dict(color="#7F77DD", width=1.5),
+        hovertemplate="%{x|%d %b %Y}<br>RSI: %{y:.1f}<extra></extra>"
+    ))
+
+    fig.add_hline(y=overbought, line_dash="dash", line_color="#E24B4A", line_width=1.5,
+                  annotation_text=f"Surachat ({overbought})", annotation_position="top left")
+    fig.add_hline(y=oversold, line_dash="dash", line_color="#1D9E75", line_width=1.5,
+                  annotation_text=f"Survente ({oversold})", annotation_position="bottom left")
+
+    fig.update_layout(
+        height=280, hovermode="x unified",
+        margin=dict(t=30, b=30, l=0, r=0),
+        plot_bgcolor="white", paper_bgcolor="white",
+        yaxis=dict(range=[0, 100], gridcolor="#f0f0f0"),
+        xaxis=dict(gridcolor="#f0f0f0"),
+        showlegend=False,
+    )
     return fig
 
 
@@ -191,14 +234,16 @@ def plot_walk_forward(wf_df: pd.DataFrame):
     return fig
 
 
-def plot_optimization_heatmap(grid_df: pd.DataFrame, metric: str, metric_label: str,
+def plot_optimization_heatmap(grid_df: pd.DataFrame, x_param: str, y_param: str,
+                              x_label: str, y_label: str, metric: str, metric_label: str,
                               current=None, best=None):
-    """Heatmap de la métrique choisie en fonction des fenêtres SMA.
+    """Heatmap générique de la métrique choisie sur une grille de 2 paramètres.
 
-    current : tuple (fast, slow) des paramètres actuels de l'utilisateur
-    best    : tuple (fast, slow) de la meilleure combinaison trouvée
+    x_param / y_param : noms des colonnes qui varient (ex: "fast"/"slow" ou
+                        "oversold"/"overbought")
+    current / best    : tuples (x, y) à marquer sur la carte
     """
-    pivot = grid_df.pivot(index="slow", columns="fast", values=metric)
+    pivot = grid_df.pivot(index=y_param, columns=x_param, values=metric)
 
     fig = go.Figure()
     fig.add_trace(go.Heatmap(
@@ -209,7 +254,7 @@ def plot_optimization_heatmap(grid_df: pd.DataFrame, metric: str, metric_label: 
         zmid=0,
         colorbar=dict(title=metric_label),
         hovertemplate=(
-            "SMA rapide: %{x}j<br>SMA lente: %{y}j<br>"
+            x_label + ": %{x}<br>" + y_label + ": %{y}<br>"
             + metric_label + ": %{z}<extra></extra>"
         ),
     ))
@@ -220,7 +265,7 @@ def plot_optimization_heatmap(grid_df: pd.DataFrame, metric: str, metric_label: 
             marker=dict(symbol="star", size=16, color="#FFD700",
                         line=dict(color="#333333", width=1)),
             name="Meilleure combinaison",
-            hovertemplate=f"Meilleur: SMA {best[0]}/{best[1]}<extra></extra>"
+            hovertemplate=f"Meilleur: {best[0]} / {best[1]}<extra></extra>"
         ))
 
     if current is not None:
@@ -228,15 +273,15 @@ def plot_optimization_heatmap(grid_df: pd.DataFrame, metric: str, metric_label: 
             x=[current[0]], y=[current[1]], mode="markers",
             marker=dict(symbol="x", size=13, color="#1a1a1a"),
             name="Paramètres actuels",
-            hovertemplate=f"Actuel: SMA {current[0]}/{current[1]}<extra></extra>"
+            hovertemplate=f"Actuel: {current[0]} / {current[1]}<extra></extra>"
         ))
 
     fig.update_layout(
         height=520,
         margin=dict(t=30, b=30, l=0, r=0),
         plot_bgcolor="white", paper_bgcolor="white",
-        xaxis_title="SMA rapide (jours)",
-        yaxis_title="SMA lente (jours)",
+        xaxis_title=x_label,
+        yaxis_title=y_label,
         legend=dict(orientation="h", yanchor="bottom", y=1.01, xanchor="left", x=0),
     )
     return fig

@@ -1,11 +1,12 @@
-"""SMA Momentum Backtester — interface Streamlit.
+"""Backtester Quantitatif — interface Streamlit.
 
 Ce fichier ne contient que l'interface et l'orchestration. La logique métier
 vit dans les modules :
-- data.py     : chargement des données (yfinance)
-- backtest.py : moteur de backtest, walk-forward, Monte Carlo
-- metrics.py  : métriques globales et par trade
-- plots.py    : graphiques Plotly
+- data.py       : chargement des données (yfinance)
+- strategies.py : génération des signaux (SMA momentum, RSI mean-reversion)
+- backtest.py   : moteur d'exécution, walk-forward, grid search, Monte Carlo
+- metrics.py    : métriques globales et par trade
+- plots.py      : graphiques Plotly
 """
 import streamlit as st
 import pandas as pd
@@ -14,10 +15,11 @@ from datetime import date
 
 import data
 import plots
+from strategies import STRATEGIES, min_bars
 from backtest import run_backtest, walk_forward_analysis, monte_carlo, grid_search
 from metrics import compute_metrics, compute_trade_metrics
 
-st.set_page_config(page_title="SMA Momentum Backtester", layout="wide")
+st.set_page_config(page_title="Backtester Quantitatif", layout="wide")
 
 st.markdown("""
 <style>
@@ -32,8 +34,8 @@ div[data-testid="metric-container"] {
 </style>
 """, unsafe_allow_html=True)
 
-st.title("SMA Momentum Backtester")
-st.caption("Stratégie de trading par croisement de moyennes mobiles simples (golden cross / death cross)")
+st.title("Backtester Quantitatif")
+st.caption("Teste et compare des stratégies momentum et mean-reversion sur données historiques")
 
 
 # Le cache Streamlit est appliqué ici (couche interface) plutôt que dans
@@ -47,10 +49,10 @@ def load_data(ticker: str, start, end):
 # le hachage : la barre de progression n'apparaît qu'au premier calcul, les
 # reruns suivants sont servis instantanément depuis le cache.
 @st.cache_data(ttl=3600, show_spinner=False)
-def run_grid_search(df, fast_values, slow_values, capital, fees,
-                    stop_loss, take_profit, _progress=None):
-    return grid_search(df, fast_values, slow_values, capital, fees,
-                       stop_loss, take_profit, progress_callback=_progress)
+def run_grid_search(df, strategy, x_param, x_values, y_param, y_values, base_params,
+                    capital, fees, stop_loss, take_profit, _progress=None):
+    return grid_search(df, strategy, x_param, x_values, y_param, y_values, base_params,
+                       capital, fees, stop_loss, take_profit, progress_callback=_progress)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -60,6 +62,11 @@ def run_grid_search(df, fast_values, slow_values, capital, fees,
 with st.sidebar:
     st.header("Paramètres")
 
+    # Sélecteur de stratégie : pilote quels paramètres afficher plus bas.
+    strategy_labels = {info["label"]: key for key, info in STRATEGIES.items()}
+    chosen_label = st.selectbox("Stratégie", list(strategy_labels.keys()))
+    strategy = strategy_labels[chosen_label]
+
     ticker = st.text_input("Ticker (ex: SPY, AAPL, MSFT)").upper().strip()
 
     col1, col2 = st.columns(2)
@@ -68,12 +75,28 @@ with st.sidebar:
     with col2:
         end_date = st.date_input("Fin", value=date.today())
 
-    sma_short = st.slider("SMA rapide (jours)", min_value=5, max_value=100, value=20, step=1)
-    sma_long = st.slider("SMA lente (jours)", min_value=20, max_value=300, value=50, step=5)
+    st.divider()
 
-    if sma_short >= sma_long:
-        st.warning("La SMA rapide doit être plus courte que la SMA lente.")
-        st.stop()
+    # Paramètres spécifiques à la stratégie choisie.
+    if strategy == "sma":
+        st.caption("**Momentum** : on suit la tendance.")
+        fast = st.slider("SMA rapide (jours)", min_value=5, max_value=100, value=20, step=1)
+        slow = st.slider("SMA lente (jours)", min_value=20, max_value=300, value=50, step=5)
+        if fast >= slow:
+            st.warning("La SMA rapide doit être plus courte que la SMA lente.")
+            st.stop()
+        params = {"fast": fast, "slow": slow}
+    else:  # rsi
+        st.caption("**Mean-reversion** : on parie sur un retour à la moyenne.")
+        period = st.slider("Période RSI (jours)", min_value=5, max_value=30, value=14, step=1)
+        oversold = st.slider("Seuil de survente — achat", min_value=10, max_value=45, value=30, step=1)
+        overbought = st.slider("Seuil de surachat — vente", min_value=55, max_value=90, value=70, step=1)
+        if oversold >= overbought:
+            st.warning("Le seuil de survente doit être inférieur au seuil de surachat.")
+            st.stop()
+        params = {"period": period, "oversold": oversold, "overbought": overbought}
+
+    st.divider()
 
     capital = st.number_input(
         "Capital initial ($)",
@@ -130,9 +153,12 @@ if st.session_state.get("backtest_on"):
         st.stop()
 
     st.success(f"{len(df)} lignes chargées pour {ticker}.")
-    st.caption(f"Période couverte : du {df.index.min().date()} au {df.index.max().date()}")
+    st.caption(
+        f"Stratégie : **{STRATEGIES[strategy]['family']}** — "
+        f"période du {df.index.min().date()} au {df.index.max().date()}"
+    )
 
-    min_required = sma_long + 10
+    min_required = min_bars(strategy, params)
     if len(df) < min_required:
         st.error(
             f"Pas assez de données pour {ticker}. "
@@ -141,7 +167,7 @@ if st.session_state.get("backtest_on"):
         st.stop()
 
     df, buy_signals, sell_signals, final_value, trades = run_backtest(
-        df, sma_short, sma_long, capital, fees, stop_loss_pct, take_profit_pct
+        df, strategy, params, capital, fees, stop_loss_pct, take_profit_pct
     )
 
     if df is None or df.empty:
@@ -182,8 +208,15 @@ if st.session_state.get("backtest_on"):
     st.markdown("<br>", unsafe_allow_html=True)
 
     # ── Graphique principal ───────────────────────────────────────────────────
-    fig = plots.plot_results(df, buy_signals, sell_signals, ticker, metrics)
+    fig = plots.plot_results(df, buy_signals, sell_signals, ticker, metrics, strategy, params)
     st.plotly_chart(fig, width="stretch")
+
+    # L'oscillateur RSI vit sur une échelle 0–100, il a son propre graphique.
+    if strategy == "rsi":
+        st.plotly_chart(
+            plots.plot_rsi(df, params["oversold"], params["overbought"]),
+            width="stretch"
+        )
 
     # ═════════════════════════════════════════════════════════════════════════
     # SECTION 1 : ANALYSE TRADE PAR TRADE
@@ -263,7 +296,7 @@ if st.session_state.get("backtest_on"):
 
     with st.spinner("Calcul du walk-forward..."):
         wf_df, wf_error = walk_forward_analysis(
-            df, sma_short, sma_long, capital, fees,
+            df, strategy, params, capital, fees,
             stop_loss_pct, take_profit_pct,
             n_windows=n_windows
         )
@@ -318,8 +351,8 @@ if st.session_state.get("backtest_on"):
     st.markdown("<br>", unsafe_allow_html=True)
     st.subheader("🗺️ Optimisation des paramètres")
     st.markdown("""
-    > **Concept clé** : la heatmap teste toutes les combinaisons de SMA et colore chaque case
-    > selon la performance. Une stratégie robuste montre une **zone** de bons paramètres
+    > **Concept clé** : la heatmap teste toutes les combinaisons de deux paramètres et colore chaque
+    > case selon la performance. Une stratégie robuste montre une **zone** de bons paramètres
     > (un plateau vert) ; un **pic isolé** entouré de rouge est presque toujours de
     > l'overfitting — du bruit statistique qu'il ne faut pas trader.
     """)
@@ -328,7 +361,7 @@ if st.session_state.get("backtest_on"):
     with opt_c1:
         resolution = st.radio(
             "Résolution de la grille",
-            ["Grossière (~100 backtests, rapide)", "Fine (~300 backtests, plus lent)"],
+            ["Grossière (rapide)", "Fine (plus lent)"],
         )
     with opt_c2:
         metric_options = {
@@ -343,19 +376,38 @@ if st.session_state.get("backtest_on"):
         st.session_state["opt_on"] = True
 
     if st.session_state.get("opt_on"):
-        if resolution.startswith("Grossière"):
-            fast_values = tuple(range(5, 61, 5))
-            slow_values = tuple(range(20, 201, 20))
-        else:
-            fast_values = tuple(range(5, 61, 3))
-            slow_values = tuple(range(20, 201, 10))
+        fine = resolution.startswith("Fine")
+
+        # Les deux axes de la grille dépendent de la stratégie.
+        if strategy == "sma":
+            x_param, y_param = "fast", "slow"
+            x_label, y_label = "SMA rapide (jours)", "SMA lente (jours)"
+            base_params = {}
+            if fine:
+                x_values = tuple(range(5, 61, 3))
+                y_values = tuple(range(20, 201, 10))
+            else:
+                x_values = tuple(range(5, 61, 5))
+                y_values = tuple(range(20, 201, 20))
+            current = (params["fast"], params["slow"])
+        else:  # rsi — on balaie les deux seuils, la période reste fixe
+            x_param, y_param = "oversold", "overbought"
+            x_label, y_label = "Seuil de survente", "Seuil de surachat"
+            base_params = {"period": params["period"]}
+            if fine:
+                x_values = tuple(range(10, 46, 2))
+                y_values = tuple(range(55, 91, 2))
+            else:
+                x_values = tuple(range(10, 46, 5))
+                y_values = tuple(range(55, 91, 5))
+            current = (params["oversold"], params["overbought"])
 
         raw_df = load_data(ticker, start_date, end_date)[0]
 
         progress = st.progress(0.0, text="Grid search en cours...")
         grid_df = run_grid_search(
-            raw_df, fast_values, slow_values, capital, fees,
-            stop_loss_pct, take_profit_pct,
+            raw_df, strategy, x_param, x_values, y_param, y_values, base_params,
+            capital, fees, stop_loss_pct, take_profit_pct,
             _progress=lambda p: progress.progress(p, text=f"Grid search... {int(p * 100)}%")
         )
         progress.empty()
@@ -364,12 +416,11 @@ if st.session_state.get("backtest_on"):
             st.warning("Aucune combinaison n'a pu être testée (période trop courte ?).")
         else:
             best_row = grid_df.loc[grid_df[metric_col].idxmax()]
-            best_fast, best_slow = int(best_row["fast"]), int(best_row["slow"])
+            best_x, best_y = int(best_row[x_param]), int(best_row[y_param])
 
             fig_opt = plots.plot_optimization_heatmap(
-                grid_df, metric_col, metric_label,
-                current=(sma_short, sma_long),
-                best=(best_fast, best_slow),
+                grid_df, x_param, y_param, x_label, y_label, metric_col, metric_label,
+                current=current, best=(best_x, best_y),
             )
             st.plotly_chart(fig_opt, width="stretch")
 
@@ -379,11 +430,18 @@ if st.session_state.get("backtest_on"):
                 "calmar": metrics["calmar"],
             }[metric_col]
 
+            if strategy == "sma":
+                best_txt = f"SMA {best_x} / {best_y}"
+                cur_txt = f"SMA {params['fast']}/{params['slow']}"
+            else:
+                best_txt = f"RSI {best_x} / {best_y}"
+                cur_txt = f"RSI {params['oversold']}/{params['overbought']}"
+
             oc1, oc2, oc3 = st.columns(3, gap="large")
-            oc1.metric("Meilleure combinaison", f"SMA {best_fast} / {best_slow}")
+            oc1.metric("Meilleure combinaison", best_txt)
             oc2.metric(f"{metric_label} optimal", f"{best_row[metric_col]:.2f}")
             oc3.metric(
-                f"{metric_label} actuel (SMA {sma_short}/{sma_long})",
+                f"{metric_label} actuel ({cur_txt})",
                 f"{current_value:.2f}",
                 delta=f"{current_value - best_row[metric_col]:+.2f} vs optimal"
             )
@@ -409,16 +467,20 @@ if st.session_state.get("backtest_on"):
     # ── Données brutes ────────────────────────────────────────────────────────
     st.markdown("<br>", unsafe_allow_html=True)
     with st.expander("Voir les données brutes"):
+        if strategy == "sma":
+            show_cols = ["Close", "SMA_fast", "SMA_slow", "portfolio", "bh"]
+            fmt = {
+                "Close": "${:.2f}", "SMA_fast": "${:.2f}", "SMA_slow": "${:.2f}",
+                "portfolio": "${:,.0f}", "bh": "${:,.0f}",
+            }
+        else:
+            show_cols = ["Close", "RSI", "portfolio", "bh"]
+            fmt = {
+                "Close": "${:.2f}", "RSI": "{:.1f}",
+                "portfolio": "${:,.0f}", "bh": "${:,.0f}",
+            }
         st.dataframe(
-            df[["Close", "SMA_fast", "SMA_slow", "portfolio", "bh"]]
-            .tail(100)
-            .style.format({
-                "Close": "${:.2f}",
-                "SMA_fast": "${:.2f}",
-                "SMA_slow": "${:.2f}",
-                "portfolio": "${:,.0f}",
-                "bh": "${:,.0f}"
-            }),
+            df[show_cols].tail(100).style.format(fmt),
             width="stretch"
         )
 
@@ -459,38 +521,33 @@ if st.session_state.get("backtest_on"):
     )
 
 else:
-    st.info("Configure les paramètres dans la barre latérale et clique sur **Lancer le backtest**.")
+    st.info("Choisis une stratégie et un ticker dans la barre latérale, puis clique sur **Lancer le backtest**.")
 
     st.markdown("""
-    ### Comment ça fonctionne
+    ### Deux familles de stratégies opposées
 
-    **Stratégie momentum SMA croisée :**
-    - **Achat (golden cross)** : quand la SMA rapide passe au-dessus de la SMA lente → signal haussier
-    - **Vente (death cross)** : quand la SMA rapide repasse en dessous → signal baissier
+    **1. Momentum — Croisement de moyennes mobiles (SMA)**
+    Parie que *ce qui monte continue de monter*. On suit la tendance.
+    - **Achat (golden cross)** : la SMA rapide passe au-dessus de la SMA lente → signal haussier
+    - **Vente (death cross)** : la SMA rapide repasse en dessous → signal baissier
+    - Brille dans les **tendances longues**, souffre dans les marchés en dents de scie.
 
-    **Exécution réaliste :** le croisement est détecté sur la clôture du jour t,
-    mais le trade est exécuté au jour **t+1** — sinon on utiliserait une information
-    qu'on ne pouvait pas connaître au moment de trader (*look-ahead bias*, le piège n°1 des backtests).
+    **2. Mean-Reversion — RSI (surachat / survente)**
+    Parie que *les excès se corrigent* : ce qui a trop chuté rebondit, ce qui a trop monté reflue.
+    - **RSI** : indicateur de 0 à 100 mesurant la vitesse des hausses vs baisses récentes
+    - **Achat** : quand le RSI passe sous le seuil de **survente** (ex: 30) → trop chuté, on anticipe un rebond
+    - **Vente** : quand le RSI dépasse le seuil de **surachat** (ex: 70) → trop monté, on anticipe un repli
+    - Brille dans les marchés **en range** (sans tendance nette), souffre dans les fortes tendances.
 
-    **Métriques calculées :**
-    - **Rendement total** : performance de la stratégie vs Buy & Hold
-    - **CAGR** : rendement annualisé composé — comparable entre périodes différentes
-    - **Ratio de Sharpe** : rendement ajusté au risque (> 1 = bon, > 2 = excellent)
-    - **Ratio de Sortino** : comme Sharpe, mais ne pénalise que la volatilité à la baisse
-    - **Ratio de Calmar** : CAGR / max drawdown — le "coût en douleur" du rendement
-    - **Max drawdown** : perte maximale depuis un sommet
-    - **Win rate (par trade)** : % de trades profitables
-    - **Profit factor** : ratio gains bruts / pertes brutes (> 1 = profitable)
+    > **La leçon** : lance la même action (ex: SPY) avec les deux stratégies. Tu verras qu'elles gagnent
+    > dans des **régimes de marché opposés**. Aucune ne gagne partout — c'est le fondement de la
+    > diversification de stratégies.
 
-    **Gestion du risque :**
-    - **Stop-Loss** : ferme automatiquement la position si le prix baisse trop depuis l'entrée
-    - **Take-Profit** : sécurise les gains si le prix monte suffisamment
+    **Exécution réaliste :** le signal est détecté sur la clôture du jour t, mais le trade est exécuté
+    au jour **t+1** — sinon on utiliserait une information qu'on ne pouvait pas connaître au moment de
+    trader (*look-ahead bias*, le piège n°1 des backtests).
 
-    **Walk-Forward Analysis :**
-    - Divise la période en N fenêtres indépendantes
-    - Vérifie si la stratégie est **robuste dans le temps** ou juste chanceuse sur une période donnée
-
-    **Optimisation des paramètres (grid search) :**
-    - Teste toutes les combinaisons de SMA et affiche une **heatmap** de performance
-    - Une **zone stable** de bons paramètres = robustesse ; un **pic isolé** = overfitting
+    **Ce que l'app calcule ensuite :** métriques de risque (Sharpe, Sortino, Calmar, drawdown, VaR),
+    analyse trade par trade, walk-forward (robustesse dans le temps), optimisation par heatmap
+    (détection d'overfitting) et simulation Monte Carlo.
     """)

@@ -1,4 +1,8 @@
-"""Moteur de backtesting : stratégie SMA croisée, walk-forward, Monte Carlo.
+"""Moteur de backtesting : exécution des trades, walk-forward, Monte Carlo.
+
+Le moteur est agnostique de la stratégie : il reçoit une colonne `signal`
+(via strategies.generate_signals) et se contente de l'exécuter. Ajouter une
+stratégie ne demande donc aucune modification ici.
 
 Aucune dépendance à Streamlit — le moteur est testable indépendamment
 de l'interface.
@@ -7,14 +11,17 @@ import numpy as np
 import pandas as pd
 
 from metrics import compute_metrics, compute_trade_metrics
+from strategies import generate_signals, min_bars
 
 
-def run_backtest(df, short_w, long_w, capital, fees=0.0, stop_loss=None, take_profit=None):
+def run_backtest(df, strategy, params, capital, fees=0.0, stop_loss=None, take_profit=None):
     """
-    Exécute le backtest SMA croisé.
+    Exécute un backtest pour n'importe quelle stratégie.
 
     Paramètres
     ----------
+    strategy    : "sma" ou "rsi"
+    params      : dict de paramètres de la stratégie (ex: {"fast": 20, "slow": 50})
     stop_loss   : float négatif (ex: -0.10 = -10%) ou None
     take_profit : float positif (ex: 0.20 = +20%) ou None
 
@@ -22,15 +29,9 @@ def run_backtest(df, short_w, long_w, capital, fees=0.0, stop_loss=None, take_pr
     --------
     df enrichi, buy_signals, sell_signals, final_value, trades (liste de dicts)
     """
-    df = df.copy()
-    df["SMA_fast"] = df["Close"].rolling(short_w).mean()
-    df["SMA_slow"] = df["Close"].rolling(long_w).mean()
-    df.dropna(inplace=True)
-
-    df["signal"] = np.where(df["SMA_fast"] > df["SMA_slow"], 1, 0)
-    # shift(1) : le croisement est détecté sur la clôture du jour t, donc le
-    # trade ne peut être exécuté qu'au jour t+1 (sinon look-ahead bias).
-    df["position"] = df["signal"].diff().shift(1).fillna(0)
+    # La stratégie produit les colonnes signal/position ; le moteur ne connaît
+    # que celles-ci à partir d'ici.
+    df = generate_signals(df, strategy, params)
 
     cash = float(capital)
     shares = 0.0
@@ -79,7 +80,7 @@ def run_backtest(df, short_w, long_w, capital, fees=0.0, stop_loss=None, take_pr
             entry_price = None
             entry_shares = None
 
-        # ── Signaux SMA ────────────────────────────────────────────────────────
+        # ── Signaux de la stratégie ───────────────────────────────────────────
         if row["position"] == 1 and cash > 0:
             fee = cash * fees
             cash -= fee
@@ -134,14 +135,14 @@ def run_backtest(df, short_w, long_w, capital, fees=0.0, stop_loss=None, take_pr
     final_value = cash + shares * float(df["Close"].iloc[-1])
     df["portfolio"] = portfolio_values
     df["bh"] = capital * df["Close"] / float(df["Close"].iloc[0])
-    df.attrs["short_w"] = short_w
-    df.attrs["long_w"] = long_w
+    df.attrs["strategy"] = strategy
+    df.attrs["params"] = params
     df.attrs["total_fees"] = total_fees_paid
 
     return df, buy_signals, sell_signals, final_value, trades
 
 
-def walk_forward_analysis(df, short_w, long_w, capital, fees, stop_loss, take_profit, n_windows=5):
+def walk_forward_analysis(df, strategy, params, capital, fees, stop_loss, take_profit, n_windows=5):
     """
     Découpe les données en n_windows fenêtres temporelles égales et exécute
     le backtest sur chacune.
@@ -151,7 +152,8 @@ def walk_forward_analysis(df, short_w, long_w, capital, fees, stop_loss, take_pr
 
     Retourne un DataFrame avec les métriques par fenêtre.
     """
-    if len(df) < (long_w + 10) * n_windows:
+    warmup = min_bars(strategy, params)
+    if len(df) < warmup * n_windows:
         return None, "Pas assez de données pour le nombre de fenêtres demandé."
 
     window_size = len(df) // n_windows
@@ -162,13 +164,13 @@ def walk_forward_analysis(df, short_w, long_w, capital, fees, stop_loss, take_pr
         end_idx = start_idx + window_size if i < n_windows - 1 else len(df)
         window_df = df.iloc[start_idx:end_idx].copy()
 
-        # Il faut assez de données pour calculer les SMA
-        if len(window_df) < long_w + 10:
+        # Il faut assez de données pour calculer l'indicateur sur la fenêtre
+        if len(window_df) < warmup:
             continue
 
         try:
             res_df, _, _, _, trades_w = run_backtest(
-                window_df, short_w, long_w, capital, fees, stop_loss, take_profit
+                window_df, strategy, params, capital, fees, stop_loss, take_profit
             )
             m = compute_metrics(res_df, capital)
             tm = compute_trade_metrics(trades_w)
@@ -193,34 +195,49 @@ def walk_forward_analysis(df, short_w, long_w, capital, fees, stop_loss, take_pr
     return pd.DataFrame(results), None
 
 
-def grid_search(df, fast_values, slow_values, capital, fees=0.0,
-                stop_loss=None, take_profit=None, progress_callback=None):
+def grid_search(df, strategy, x_param, x_values, y_param, y_values, base_params,
+                capital, fees=0.0, stop_loss=None, take_profit=None, progress_callback=None):
     """
-    Backteste toutes les combinaisons (SMA rapide, SMA lente) valides.
+    Backteste toutes les combinaisons de deux paramètres (grille 2D).
+
+    Générique : les deux axes varient (x_param, y_param), les autres paramètres
+    restent fixes (base_params). Exemple SMA : x=fast, y=slow. Exemple RSI :
+    x=oversold, y=overbought, base_params={"period": 14}.
 
     Objectif pédagogique : visualiser la sensibilité aux paramètres. Une
-    stratégie robuste montre une ZONE de bons paramètres ; un pic isolé
-    entouré de mauvais résultats est un signe d'overfitting.
+    stratégie robuste montre une ZONE de bons résultats ; un pic isolé entouré
+    de mauvais résultats est un signe d'overfitting.
 
-    progress_callback : fonction optionnelle appelée avec l'avancement (0 à 1)
-    — permet à l'interface d'afficher une barre de progression sans que le
-    moteur dépende de Streamlit.
+    progress_callback : fonction optionnelle appelée avec l'avancement (0 à 1),
+    pour que l'interface affiche une barre sans que le moteur dépende de Streamlit.
 
-    Retourne un DataFrame avec une ligne par combinaison testée, ou None.
+    Retourne un DataFrame (une ligne par combinaison valide) ou None.
     """
-    combos = [(f, s) for f in fast_values for s in slow_values if f < s]
+    combos = [(x, y) for x in x_values for y in y_values]
     if not combos:
         return None
 
     results = []
-    for i, (f, s) in enumerate(combos):
-        if len(df) >= s + 10:
+    for i, (x, y) in enumerate(combos):
+        params = {**base_params, x_param: x, y_param: y}
+
+        # Certaines combinaisons n'ont pas de sens (SMA rapide >= lente, ou
+        # seuil de survente >= seuil de surachat) : on les saute.
+        valid = True
+        if strategy == "sma" and params["fast"] >= params["slow"]:
+            valid = False
+        if strategy == "rsi" and params["oversold"] >= params["overbought"]:
+            valid = False
+
+        if valid and len(df) >= min_bars(strategy, params):
             try:
-                res_df, _, _, _, _ = run_backtest(df, f, s, capital, fees, stop_loss, take_profit)
+                res_df, _, _, _, _ = run_backtest(
+                    df, strategy, params, capital, fees, stop_loss, take_profit
+                )
                 m = compute_metrics(res_df, capital)
                 results.append({
-                    "fast": f,
-                    "slow": s,
+                    x_param: x,
+                    y_param: y,
                     "sharpe": round(m["sharpe"], 2),
                     "total_return": round(m["total_return"], 2),
                     "calmar": round(m["calmar"], 2),
